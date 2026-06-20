@@ -1,258 +1,401 @@
 import streamlit as st
 import numpy as np
 import matplotlib
-matplotlib.use("Agg") # Force headless rendering to prevent Linux web server crashes
-import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from matplotlib.ticker import MaxNLocator
-from scipy.interpolate import RectBivariateSpline
+matplotlib.use("Agg")  # Mandatory for Streamlit Cloud to prevent server crashes
+import matplotlib.pyplot as plt # <--- EXACTLY LIKE THIS (NO 's' AT THE END)
+from matplotlib.patches import Rectangle, Circle
 import os
 
 # ==========================================
-# 1. UI ARCHITECTURE & AZ BRANDING
+# 1. PAGE CONFIG & SESSION STATE
 # ==========================================
-st.set_page_config(page_title="AZ Thin Film | Inline Multiphysics Sim", layout="wide")
+st.set_page_config(page_title="AZ Thin Film | Inline Simulator", layout="wide")
 
 st.markdown("""
     <style>
     .stApp { background-color: #F8FAFC; }
-    h1, h2, h3, h4 { color: #1E3A8A; font-family: 'Helvetica Neue', sans-serif; }
+    h1, h2, h3 { color: #1E3A8A; font-family: 'Helvetica Neue', sans-serif; }
     .stMetric { border-left: 4px solid #1E3A8A; padding-left: 15px; background-color: #ffffff; padding: 10px; border-radius: 5px; box-shadow: 0px 2px 4px rgba(0,0,0,0.05); }
     </style>
 """, unsafe_allow_html=True)
 
-st.sidebar.markdown("<h2 style='color:#1E3A8A; text-align:center;'>AZ Thin Film Research</h2>", unsafe_allow_html=True)
-if os.path.exists("logo.png"):
-    st.sidebar.image("logo.png", use_container_width=True)
-st.sidebar.markdown("---")
+# Initialize global variables in Session State so they persist across pages
+def init_state(key, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# Layout Geometry
+init_state('t2t_gap', 200.0)
+init_state('tts', 100.0)
+init_state('t_thick', 10.0)
+init_state('t_length', 1000.0)
+init_state('sub_width', 600.0)
+
+# Process & Power
+init_state('mat_a', 'Ti')
+init_state('mat_b', 'Ti')
+init_state('ps_type', 'Bi-Polar Pulse DC')
+init_state('ps_freq', 40.0)
+init_state('power_kw', 10.0)
+init_state('sub_vel', 20.0)
+
+# Gas & Pumping
+init_state('gas_main', 'Ar')
+init_state('flow_main', 150.0)
+init_state('gas_react', 'N2')
+init_state('flow_react', 50.0)
+init_state('manifold', 'Both')
+init_state('num_zones', 3)
+init_state('pump_speed', 500.0)
+
+# Magnetics & Plume
+init_state('mag_ang_a', 15.0)
+init_state('mag_ang_b', -15.0)
+init_state('b_avg', 400.0)
+init_state('ta_ratio', 1.25)
+init_state('plume_override', False)
+init_state('plume_n', 1.5)
+
+TUBE_OD = 132.5
+TUBE_ID = 125.0
 
 # ==========================================
-# 2. ENGINEERING INPUTS (SIDEBAR)
+# 2. SIDEBAR NAVIGATION WIZARD
 # ==========================================
-st.sidebar.header("1. Target Materials & Power")
-mat_A = st.sidebar.selectbox("Cathode A Material", ["Ti", "Al", "Si", "Nb", "Cu"])
-mat_B = st.sidebar.selectbox("Cathode B Material", ["Ti", "Al", "Si", "Nb", "Cu"], index=1)
-power_supply = st.sidebar.selectbox("Power Supply Type", ["DC", "Pulsed DC", "AC (Dual)", "HiPIMS"])
-total_power = st.sidebar.slider("Power per Cathode (kW)", 2.0, 40.0, 10.0, step=0.5)
+st.sidebar.markdown("<h2 style='color:#1E3A8A; text-align:center;'>AZ Thin Film</h2>", unsafe_allow_html=True)
+if os.path.exists("logo.png"): st.sidebar.image("logo.png")
+st.sidebar.markdown("### Process Setup Wizard")
 
-st.sidebar.header("2. Reactive Berg Model")
-pressure = st.sidebar.slider("Process Pressure (mTorr)", 0.5, 15.0, 3.0, step=0.5)
-reactive_flow = st.sidebar.slider("Reactive Gas Flow (sccm)", 0, 150, 45)
-pump_speed = st.sidebar.slider("Pumping Speed (L/s)", 100, 2000, 500)
+page = st.sidebar.radio("Navigate Design Steps:", [
+    "1. Chamber & Target Layout",
+    "2. Process Settings & Gas",
+    "3. Magnetics & Plume",
+    "4. Summary & Final Simulation"
+])
+st.sidebar.divider()
+st.sidebar.info("Variables are saved automatically as you move between screens.")
 
-st.sidebar.header("3. Inline Geometry")
-sub_width = st.sidebar.slider("Substrate Cross-Web Width (mm)", 100, 1000, 400)
-t_length = st.sidebar.slider("Target Length (X-Axis) (mm)", 300, 1500, 600)
-c_spacing = st.sidebar.slider("Cathode Gap (Y-Axis) (mm)", 100, 300, 150)
-t_to_s = st.sidebar.slider("Target-to-Substrate Dist (mm)", 50, 200, 100)
-sub_speed = st.sidebar.slider("Linear Travel Speed (mm/s)", 1.0, 100.0, 20.0)
-
-st.sidebar.header("4. Magnetic Field Control")
-b_straight = st.sidebar.slider("Straightaway B-Field (Gauss)", 200, 1000, 400)
-b_turn_ratio = st.sidebar.slider("Turnaround Strength Multiplier", 0.5, 2.0, 1.25, 
-                                 help=">1.0 intensifies plasma at the tube ends (dog-boning).")
-sputter_angle = st.sidebar.slider("Inward Sputter Angle (deg)", -20, 45, 15, 
-                                  help="Positive angle points Cathode A and B inwards toward each other.")
-
-# Empirical Material Properties Proxy (Relative Yield, Reactive Affinity, Bulk Density)
-MAT_PROPS = {
-    "Ti": {"yield": 0.5, "affinity": 1.5, "rho": 4.50},
-    "Al": {"yield": 1.2, "affinity": 1.2, "rho": 2.70},
-    "Si": {"yield": 0.4, "affinity": 0.9, "rho": 2.33},
-    "Nb": {"yield": 0.6, "affinity": 1.4, "rho": 8.57},
-    "Cu": {"yield": 2.0, "affinity": 0.2, "rho": 8.96}
-}
+def apply_watermark(fig):
+    fig.text(0.5, 0.02, "Simulation provided by AZ Thin Film Research | www.azthinfilm.com", ha='center', fontsize=8, color='gray')
 
 # ==========================================
-# 3. MULTIPHYSICS SOLVERS
+# PAGE 1: CHAMBER & TARGET LAYOUT
 # ==========================================
-@st.cache_data
-def calculate_berg_hysteresis(flow, pump, press, power, m1, m2):
-    """Steady-State proxy for Reactive Target Poisoning."""
-    avg_affinity = (MAT_PROPS[m1]["affinity"] + MAT_PROPS[m2]["affinity"]) / 2.0
-    # Phenomenological critical poisoning point
-    q_crit = (pump * press * 0.02) + (power * avg_affinity * 1.5) 
+if page == "1. Chamber & Target Layout":
+    st.title("Step 1: Chamber Geometry & Target Layout")
+    col1, col2 = st.columns([1, 1.5])
     
-    # Logistic transition mimicking the S-curve
-    theta_t = 1.0 / (1.0 + np.exp(-(flow - q_crit) / max(2.0, pump/200.0)))
-    
-    # Deposition rate dynamically collapses from metallic to compound phase
-    rate_multiplier = 1.0 - (0.85 * theta_t) 
-    return theta_t, rate_multiplier, q_crit
-
-@st.cache_data
-def calculate_plasma_impedance(power, press, b_field, supply):
-    """Phenomenological V-I solver based on ExB electron confinement."""
-    # V scales with sqrt of power, inversely with B-field and Pressure
-    v_base = 350.0 * (power / 10.0)**0.4
-    v_conf = v_base * (400.0 / b_field)**0.5 * (3.0 / press)**0.15 
-    
-    if supply == "HiPIMS":
-        v_conf *= 1.8 # Massive density pulse pushes V up, Z drops transiently
-    elif supply == "AC (Dual)":
-        v_conf *= 0.95 
+    with col1:
+        st.session_state.t2t_gap = st.slider("Target-to-Target Axis Distance (mm)", 100.0, 500.0, st.session_state.t2t_gap, 10.0)
+        st.session_state.tts = st.slider("Target-to-Substrate Distance (TTS) (mm)", 50.0, 300.0, st.session_state.tts, 5.0)
+        st.session_state.t_thick = st.slider("Target Material Thickness (mm)", 1.0, 30.0, float(st.session_state.t_thick), 1.0)
+        st.session_state.t_length = st.slider("Target Length (mm)", 300.0, 4000.0, float(st.session_state.t_length), 100.0)
+        st.session_state.sub_width = st.slider("Substrate Width (mm)", 100.0, 3000.0, float(st.session_state.sub_width), 50.0)
         
-    current = (power * 1000.0) / v_conf
-    impedance = v_conf / current
-    return v_conf, current, impedance
+        tot_od = TUBE_OD + 2*st.session_state.t_thick
+        st.info(f"Standard {TUBE_OD}mm OD / {TUBE_ID}mm ID Base Tube.\n\n**Total Target OD:** {tot_od:.1f} mm")
 
-def estimate_thornton_szm(voltage, press, ts_dist, supply):
-    """Thornton Structure Zone Estimator based on adatom kinetic energy proxy."""
-    pd_product = press * (ts_dist / 10.0) # mTorr * cm
-    energy_proxy = (voltage / 10.0) / max(pd_product, 0.5)
-    
-    if supply == "HiPIMS":
-        energy_proxy *= 2.5 # Ionization fraction boosts adatom bombardment
+    with col2:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), gridspec_kw={'height_ratios': [1.5, 1]})
         
-    if energy_proxy > 80:
-        return "Zone T (Dense, Smooth, Compressive)", 98.5
-    elif energy_proxy > 30:
-        return "Zone 2 (Columnar, Crystalline)", 88.0
-    else:
-        return "Zone 1 (Porous, Voided, Tensile)", 72.0
-
-# ==========================================
-# 4. CONTINUOUS 3D POINT CLOUD ENGINE
-# ==========================================
-@st.cache_data
-def compute_static_flux_field(t_len, c_gap, t2s, angle_deg, b_ratio, ps_type, m1, m2):
-    """Generates the static 2D cross-web interference matrix from unrolled 3D cylinders."""
-    x_grid = np.linspace(-t_len*0.8, t_len*0.8, 120) # Cross-Web Axis
-    y_grid = np.linspace(-c_gap*2, c_gap*2, 100)     # Machine Direction Axis
-    X, Y = np.meshgrid(x_grid, y_grid)
-    
-    n_collimation = 2.0 if ps_type == "HiPIMS" else 1.0 # Cosine exponent
-    
-    def calculate_plume(y_pos, tilt_deg, material):
-        tilt_rad = np.radians(tilt_deg)
-        flux = np.zeros_like(X)
-        y_scale = MAT_PROPS[material]["yield"]
+        # 2D Machine Direction View
+        ax1.set_title("2D Target & Substrate Layout (Machine Direction)", fontweight="bold")
+        ax1.axhline(0, color='gray', lw=4, label="Substrate Translation Plane")
+        ax1.plot([-st.session_state.sub_width/2, st.session_state.sub_width/2], [0, 0], color='cyan', lw=6)
         
-        # Discretize target into points along the X-axis
-        tube_x = np.linspace(-t_len/2, t_len/2, 60)
-        R_tube = 45.0
+        cx_L, cx_R = -st.session_state.t2t_gap/2, st.session_state.t2t_gap/2
+        cy = st.session_state.tts + (tot_od/2)
         
-        for tx in tube_x:
-            # Turnaround Dog-bone polynomial modifier at target ends
-            u = 2.0 * tx / t_len 
-            intensity = 1.0 + (b_ratio - 1.0) * (abs(u)**6)
+        for cx, label in [(cx_L, "Target L"), (cx_R, "Target R")]:
+            ax1.add_patch(Circle((cx, cy), tot_od/2, fill=False, ec='#1E3A8A', lw=3))
+            ax1.add_patch(Circle((cx, cy), TUBE_OD/2, fill=True, color='lightgray'))
+            ax1.add_patch(Circle((cx, cy), TUBE_ID/2, fill=True, color='white'))
+            ax1.plot([cx], [cy], 'k+', markersize=8)
+            ax1.text(cx, cy + tot_od/2 + 10, label, ha='center', fontweight='bold')
             
-            # Represent two parallel legs of the racetrack (offset +/- 20 deg from tilt)
-            for leg_offset in [np.radians(20), np.radians(-20)]:
-                leg_angle = tilt_rad + leg_offset
-                
-                emit_y = y_pos + R_tube * np.sin(leg_angle)
-                emit_z = R_tube - R_tube * np.cos(leg_angle)
-                
-                # Normal Vectors rotated by tilt
-                ny = np.sin(leg_angle)
-                nz = -np.cos(leg_angle)
-                
-                dx = X - tx
-                dy = Y - emit_y
-                dz = t2s - emit_z
-                
-                dist_sq = dx**2 + dy**2 + dz**2
-                dist = np.sqrt(dist_sq)
-                
-                cos_emit = np.clip((dy*ny + dz*nz) / dist, 0, 1)
-                cos_sub = dz / dist
-                
-                flux += intensity * (cos_emit**n_collimation) * cos_sub / dist_sq * y_scale
-                
-        return flux
-
-    # Generate Cathode A (Negative Y, Tilted Inward) & Cathode B (Positive Y, Tilted Inward)
-    flux_A = calculate_plume(-c_gap/2, angle_deg, m1)
-    flux_B = calculate_plume(c_gap/2, -angle_deg, m2) 
-    
-    return x_grid, y_grid, flux_A, flux_B
+        ax1.set_aspect('equal')
+        ax1.set_xlim(-max(st.session_state.t2t_gap, st.session_state.sub_width)/2 - 100, max(st.session_state.t2t_gap, st.session_state.sub_width)/2 + 100)
+        ax1.set_ylim(-20, cy + tot_od/2 + 40)
+        ax1.set_xlabel("Cross-Web Axis (mm)")
+        ax1.set_ylabel("Vertical Axis (mm)")
+        
+        # Rough Geometric Cross-Substrate Profile
+        x_rough = np.linspace(-st.session_state.sub_width/2*1.2, st.session_state.sub_width/2*1.2, 200)
+        gamma = st.session_state.tts
+        dep_l = gamma**2 / ((x_rough - cx_L)**2 + gamma**2)
+        dep_r = gamma**2 / ((x_rough - cx_R)**2 + gamma**2)
+        
+        ax2.set_title("Rough Geometric Cross-Substrate Deposition Proxy", fontweight="bold")
+        ax2.plot(x_rough, dep_l, 'r--', label='Target L Proxy')
+        ax2.plot(x_rough, dep_r, 'b--', label='Target R Proxy')
+        ax2.plot(x_rough, dep_l + dep_r, 'k-', lw=2, label='Combined')
+        ax2.axvspan(-st.session_state.sub_width/2, st.session_state.sub_width/2, color='gray', alpha=0.2, label='Substrate Width')
+        ax2.set_xlabel("Cross-Web Axis (mm)")
+        ax2.set_ylabel("Relative Flux Intensity")
+        ax2.legend()
+        
+        apply_watermark(fig)
+        st.pyplot(fig)
 
 # ==========================================
-# 5. EXECUTE PHYSICS ENGINE
+# PAGE 2: PROCESS SETTINGS & GAS
 # ==========================================
-theta_t, rate_mult, q_crit = calculate_berg_hysteresis(reactive_flow, pump_speed, pressure, total_power, mat_A, mat_B)
-voltage, current, impedance = calculate_plasma_impedance(total_power, pressure, b_straight, power_supply)
-structure, density = estimate_thornton_szm(voltage, pressure, t_to_s, power_supply)
+elif page == "2. Process Settings & Gas":
+    st.title("Step 2: Power, Velocity & Gases")
+    col1, col2 = st.columns([1, 1.5])
+    
+    with col1:
+        st.subheader("Process & Material Settings")
+        st.session_state.mat_a = st.selectbox("Left Target Material", ["Ti", "Al", "Si", "Nb", "Cu", "Cr"], index=["Ti", "Al", "Si", "Nb", "Cu", "Cr"].index(st.session_state.mat_a))
+        st.session_state.mat_b = st.selectbox("Right Target Material", ["Ti", "Al", "Si", "Nb", "Cu", "Cr"], index=["Ti", "Al", "Si", "Nb", "Cu", "Cr"].index(st.session_state.mat_b))
+        st.session_state.sub_vel = st.slider("Substrate Velocity (mm/s)", 1.0, 150.0, float(st.session_state.sub_vel))
+        
+        st.session_state.ps_type = st.selectbox("Power Supply Architecture", ["DC", "Pulsed DC", "AC", "Bi-Polar Pulse DC", "HiPIMS"], index=["DC", "Pulsed DC", "AC", "Bi-Polar Pulse DC", "HiPIMS"].index(st.session_state.ps_type))
+        if st.session_state.ps_type in ["Pulsed DC", "AC", "Bi-Polar Pulse DC", "HiPIMS"]:
+            st.session_state.ps_freq = st.slider("Operating Frequency (kHz)", 10.0, 350.0, float(st.session_state.ps_freq))
+        
+        # Max Power based on length (approx ~20 kW/m limit)
+        max_power = float((st.session_state.t_length / 1000.0) * 20.0)
+        safe_val = min(st.session_state.power_kw, max_power * 1.5)
+        st.session_state.power_kw = st.slider(f"Operating Power (kW) [Thermal Limit ~{max_power:.1f} kW]", 1.0, max_power*1.5, float(safe_val))
+        
+        st.subheader("Gases & Pumping")
+        g1, g2 = st.columns(2)
+        st.session_state.gas_main = g1.text_input("Main Gas", st.session_state.gas_main)
+        st.session_state.flow_main = g1.number_input("Main Flow (sccm)", 0.0, 1000.0, float(st.session_state.flow_main))
+        st.session_state.gas_react = g2.text_input("Reactive Gas", st.session_state.gas_react)
+        st.session_state.flow_react = g2.number_input("Reactive Flow (sccm)", 0.0, 1000.0, float(st.session_state.flow_react))
+        
+        st.session_state.manifold = st.selectbox("Gas Manifold Position", ["Between Targets", "Outside Targets", "Both"])
+        st.session_state.num_zones = st.number_input("Number of MFCs (Zones)", 1, 10, int(st.session_state.num_zones))
+        st.session_state.pump_speed = st.slider("Estimated Pumping Speed (L/s)", 100.0, 3000.0, float(st.session_state.pump_speed), 100.0)
 
-x_grid, y_grid, flux_A, flux_B = compute_static_flux_field(t_length, c_spacing, t_to_s, sputter_angle, b_turn_ratio, power_supply, mat_A, mat_B)
+    with col2:
+        fig = plt.figure(figsize=(10, 8))
+        gs = fig.add_gridspec(2, 1, height_ratios=[2, 1])
+        ax_sys = fig.add_subplot(gs[0])
+        ax_wave = fig.add_subplot(gs[1])
+        
+        # Substrate
+        ax_sys.add_patch(Rectangle((-st.session_state.sub_width/2, -10), st.session_state.sub_width, 10, color='gray'))
+        ax_sys.arrow(0, -5, 50, 0, width=2, head_width=8, color='cyan')
+        ax_sys.text(0, -25, f"Velocity: {st.session_state.sub_vel} mm/s", ha='center')
+        
+        # Targets
+        c_l, c_r = -st.session_state.t2t_gap/2, st.session_state.t2t_gap/2
+        tot_od = TUBE_OD + 2*st.session_state.t_thick
+        z_t = st.session_state.tts + tot_od/2
+        
+        ax_sys.add_patch(Circle((c_l, z_t), tot_od/2, color='#1E3A8A'))
+        ax_sys.text(c_l, z_t, st.session_state.mat_a, color='white', ha='center', va='center')
+        ax_sys.add_patch(Circle((c_r, z_t), tot_od/2, color='#FF4B4B'))
+        ax_sys.text(c_r, z_t, st.session_state.mat_b, color='white', ha='center', va='center')
+        
+        # Gas Manifolds
+        if "Outside" in st.session_state.manifold or "Both" in st.session_state.manifold:
+            ax_sys.add_patch(Rectangle((c_l - tot_od, z_t), 10, -50, color='green'))
+            ax_sys.add_patch(Rectangle((c_r + tot_od - 10, z_t), 10, -50, color='green'))
+        if "Between" in st.session_state.manifold or "Both" in st.session_state.manifold:
+            ax_sys.add_patch(Rectangle((-5, z_t), 10, -50, color='green'))
+            
+        # Power Supply Dynamic Wiring
+        ps = st.session_state.ps_type
+        if ps in ["AC", "Bi-Polar Pulse DC"]:
+            ax_sys.add_patch(Rectangle((-80, z_t + tot_od + 20), 160, 40, color='gold', ec='black'))
+            ax_sys.text(0, z_t + tot_od + 40, f"1x {ps} PS\n({st.session_state.power_kw} kW)", ha='center', va='center', fontweight='bold')
+            ax_sys.plot([-40, c_l], [z_t + tot_od + 20, z_t], 'k-', lw=3)
+            ax_sys.plot([40, c_r], [z_t + tot_od + 20, z_t], 'k-', lw=3)
+        else:
+            ax_sys.add_patch(Rectangle((-120, z_t + tot_od + 20), 100, 40, color='gold', ec='black'))
+            ax_sys.text(-70, z_t + tot_od + 40, f"PS 1 ({ps})\n{st.session_state.power_kw/2:.1f} kW", ha='center', va='center', fontweight='bold')
+            ax_sys.plot([-70, c_l], [z_t + tot_od + 20, z_t], 'k-', lw=3)
+            
+            ax_sys.add_patch(Rectangle((20, z_t + tot_od + 20), 100, 40, color='gold', ec='black'))
+            ax_sys.text(70, z_t + tot_od + 40, f"PS 2 ({ps})\n{st.session_state.power_kw/2:.1f} kW", ha='center', va='center', fontweight='bold')
+            ax_sys.plot([70, c_r], [z_t + tot_od + 20, z_t], 'k-', lw=3)
 
-# Apply dynamic Berg poisoning rate drop to the absolute flux arrays
-scalar = (total_power * 10.0) * rate_mult
-flux_A_scaled = (flux_A / np.max(flux_A + flux_B)) * scalar
-flux_B_scaled = (flux_B / np.max(flux_A + flux_B)) * scalar
-total_flux_2d = flux_A_scaled + flux_B_scaled
-
-# KINEMATIC INTEGRATION: Substrate translates linearly through the Y-Axis plume
-# We sum the flux along the Machine Direction (Y) to get Accumulated Cross-Web Thickness (X)
-dy = y_grid[1] - y_grid[0]
-accum_A = np.sum(flux_A_scaled, axis=0) * (dy / sub_speed)
-accum_B = np.sum(flux_B_scaled, axis=0) * (dy / sub_speed)
-accum_total = accum_A + accum_B
-
-# Isolate data exclusively on the specified substrate width
-sub_mask = (x_grid >= -sub_width/2) & (x_grid <= sub_width/2)
-accum_sub = accum_total[sub_mask]
-mean_thk = np.mean(accum_sub)
-uniformity = (np.max(accum_sub) - np.min(accum_sub)) / (2 * mean_thk) * 100
-
-homogeneity = np.mean(accum_A[sub_mask] / (accum_total[sub_mask] + 1e-9))
+        ax_sys.set_aspect('equal')
+        ax_sys.set_xlim(-max(st.session_state.t2t_gap, st.session_state.sub_width)/2 - 80, max(st.session_state.t2t_gap, st.session_state.sub_width)/2 + 80)
+        ax_sys.set_ylim(-40, z_t + tot_od + 80)
+        ax_sys.axis('off')
+        
+        # Waveform Visualizer
+        t = np.linspace(0, 4*np.pi, 400)
+        ax_wave.set_title(f"Expected Target Voltage Phase Timing ({ps})", fontweight='bold')
+        if ps == "AC":
+            ax_wave.plot(t, np.sin(t), 'r', label="Cathode A Voltage")
+            ax_wave.plot(t, np.sin(t + np.pi), 'b--', label="Cathode B Voltage")
+        elif ps == "Bi-Polar Pulse DC":
+            ax_wave.plot(t, np.sign(np.sin(t)), 'r', drawstyle='steps-pre', label="Cathode A Phase")
+            ax_wave.plot(t, np.sign(np.sin(t + np.pi)), 'b--', drawstyle='steps-pre', label="Cathode B Phase")
+        elif ps == "Pulsed DC":
+            ax_wave.plot(t, np.where(np.sin(t*2)>0, 1, 0), 'r', drawstyle='steps-pre', label="Cathode A & B")
+        elif ps == "HiPIMS":
+            ax_wave.plot(t, np.where(np.mod(t, 2*np.pi)<0.5, 5, 0), 'r', label="Cathode A & B")
+        else:
+            ax_wave.plot(t, np.ones_like(t), 'r', label="Cathode A & B (DC)")
+            
+        ax_wave.set_yticks([])
+        ax_wave.set_xlabel("Time (µs)")
+        ax_wave.legend(loc="upper right", fontsize=8)
+        apply_watermark(fig)
+        st.pyplot(fig)
 
 # ==========================================
-# 6. DASHBOARD & VISUALIZATION
+# PAGE 3: MAGNETICS & PLUME
 # ==========================================
-# Core Diagnostics Metrics
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Plasma Impedance", f"{impedance:.1f} Ω", f"{int(voltage)} V | {current:.1f} A")
-m2.metric("Target Mode", "Poisoned" if theta_t > 0.8 else "Transition" if theta_t > 0.2 else "Metallic", f"{theta_t*100:.1f}% Covered")
-m3.metric("Dyn. Pass Dep Rate", f"{mean_thk:.1f} nm/pass")
-m4.metric("Est. Film Density", f"{density:.1f} %")
-m5.metric("Cross-Web Uniformity", f"± {uniformity:.2f} %", delta="Target < 5%", delta_color="inverse")
+elif page == "3. Magnetics & Plume":
+    st.title("Step 3: Magnetics & Sputter Angle")
+    col1, col2 = st.columns([1, 1.5])
+    
+    with col1:
+        st.session_state.mag_ang_a = st.slider("Left Magnet Bar Angle (deg)", -45.0, 45.0, float(st.session_state.mag_ang_a), help="Positive points inwards toward the center gap")
+        st.session_state.mag_ang_b = st.slider("Right Magnet Bar Angle (deg)", -45.0, 45.0, float(st.session_state.mag_ang_b), help="Negative points inwards toward the center gap")
+        st.session_state.b_avg = st.slider("Average Straightaway B-Field (Gauss)", 150.0, 1000.0, float(st.session_state.b_avg))
+        st.session_state.ta_ratio = st.slider("Turnaround to Straightaway Ratio", 0.5, 2.5, float(st.session_state.ta_ratio))
+        
+        st.divider()
+        st.subheader("Plasma Plume Profiler")
+        # AI Collimation estimator
+        est_n = 1.0
+        if st.session_state.ps_type == "HiPIMS": est_n += 1.5
+        elif st.session_state.ps_type in ["AC", "Bi-Polar Pulse DC"]: est_n += 0.3
+        elif st.session_state.ps_type == "Pulsed DC": est_n += 0.1
+        if "O2" in st.session_state.gas_react or "N2" in st.session_state.gas_react: est_n += 0.1
+        
+        st.session_state.plume_override = st.checkbox("Override Equation Estimation?", st.session_state.plume_override)
+        if st.session_state.plume_override:
+            st.session_state.plume_n = st.slider("Manual Plume Shape Factor (Cos^n)", 0.5, 5.0, float(st.session_state.plume_n))
+        else:
+            st.session_state.plume_n = est_n
+            st.info(f"💡 **AI Auto-Estimation:** Based on {st.session_state.ps_type} and {st.session_state.gas_react}, Plume Collimation Exponent is estimated at **Cos^{est_n:.2f}(\u03B8)**.")
 
-st.info(f"**Thornton Structure Zone Estimate:** {structure}  |  **Film Core Homogeneity:** {homogeneity*100:.1f}% `{mat_A}` / {(1-homogeneity)*100:.1f}% `{mat_B}`")
-st.divider()
+    with col2:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        c_l, c_r = -st.session_state.t2t_gap/2, st.session_state.t2t_gap/2
+        tot_r = (TUBE_OD + 2*st.session_state.t_thick)/2
+        z_t = st.session_state.tts + tot_r
+        
+        ax.axhline(0, color='cyan', lw=4, label="Substrate Translation Path")
+        
+        for cx, ang, color in [(c_l, st.session_state.mag_ang_a, 'red'), (c_r, st.session_state.mag_ang_b, 'blue')]:
+            ax.add_patch(Circle((cx, z_t), tot_r, fill=False, ec='#1E3A8A', lw=2))
+            
+            # Pointing vector
+            ang_rad = np.radians(-90 + ang)
+            px = cx + tot_r * np.cos(ang_rad)
+            pz = z_t + tot_r * np.sin(ang_rad)
+            ax.plot([cx, px], [z_t, pz], color='k', lw=3)
+            
+            # Draw Plasma Plume Lobe relative to collimation factor
+            angles = np.linspace(ang_rad - np.pi/2, ang_rad + np.pi/2, 100)
+            r_lobe = 80 * np.maximum(0, np.cos(angles - ang_rad))**st.session_state.plume_n
+            lobe_x = px + r_lobe * np.cos(angles)
+            lobe_z = pz + r_lobe * np.sin(angles)
+            ax.fill(lobe_x, lobe_z, color=color, alpha=0.3)
+            
+        ax.set_aspect('equal')
+        ax.set_xlim(-st.session_state.t2t_gap - 150, st.session_state.t2t_gap + 150)
+        ax.set_ylim(-20, z_t + tot_r + 20)
+        ax.set_xlabel("Cross-Web Axis (mm)")
+        ax.set_ylabel("Vertical Axis (mm)")
+        ax.set_title("Magnet Bar Directionality Vectors")
+        apply_watermark(fig)
+        st.pyplot(fig)
 
-col_plot1, col_plot2 = st.columns([1.2, 1])
+# ==========================================
+# PAGE 4: FINAL SIMULATION SUMMARY
+# ==========================================
+elif page == "4. Summary & Final Simulation":
+    st.title("Step 4: Process Summary & Linear Deposition Simulation")
+    
+    st.markdown("### Process Setup Summary")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Hardware Layout", f"Gap: {st.session_state.t2t_gap}mm", f"TTS: {st.session_state.tts}mm")
+    c2.metric("Power & Velocity", f"{st.session_state.power_kw}kW ({st.session_state.ps_type})", f"{st.session_state.sub_vel} mm/s")
+    c3.metric("Gas Network", f"{st.session_state.flow_main} {st.session_state.gas_main} + {st.session_state.flow_react} {st.session_state.gas_react}", f"{st.session_state.num_zones} Zones | Pump: {st.session_state.pump_speed}L/s")
+    c4.metric("Magnetic Setup", f"A: {st.session_state.mag_ang_a}° | B: {st.session_state.mag_ang_b}°", f"Plume Factor: Cos^{st.session_state.plume_n:.2f}")
+    st.divider()
+    
+    with st.spinner("Calculating 3D Multiphysics Field & Kinematic Machine Integration..."):
+        # Setup kinematic mesh grid (X is cross-web, Y is machine travel)
+        x_grid = np.linspace(-st.session_state.sub_width/2 - 100, st.session_state.sub_width/2 + 100, 150)
+        y_grid = np.linspace(-st.session_state.t2t_gap - st.session_state.tts*3, st.session_state.t2t_gap + st.session_state.tts*3, 150)
+        X, Y = np.meshgrid(x_grid, y_grid)
+        
+        def calculate_flux(y_pos, tilt_deg):
+            tilt_rad = np.radians(tilt_deg)
+            flux = np.zeros_like(X)
+            tube_x = np.linspace(-st.session_state.t_length/2, st.session_state.t_length/2, 60)
+            n_col = st.session_state.plume_n
+            tts = st.session_state.tts
+            
+            ny = np.sin(tilt_rad)
+            nz = -np.cos(tilt_rad) # Normal pointing down toward substrate at Z=0
+            
+            for tx in tube_x:
+                u = 2.0 * tx / st.session_state.t_length
+                # Turnaround strength dog-boning modification at the ends
+                intensity = 1.0 + (st.session_state.ta_ratio - 1.0) * (abs(u)**6)
+                
+                dx_real = X - tx
+                dy_real = Y - y_pos
+                dz_real = tts
+                
+                dist = np.sqrt(dx_real**2 + dy_real**2 + dz_real**2)
+                
+                # Dot product for emission angle
+                cos_emit = np.clip((dy_real*ny + dz_real*nz) / dist, 0, 1)
+                cos_sub = dz_real / dist
+                
+                flux += intensity * (cos_emit**n_col) * cos_sub / (dist**2)
+            return flux
 
-with col_plot1:
-    st.subheader("Kinematic Cross-Web Accumulation")
-    fig1, ax1 = plt.subplots(figsize=(8, 5))
-    
-    ax1.plot(x_grid, accum_total, color='#1E3A8A', lw=3, label='Combined Total Profile')
-    ax1.plot(x_grid, accum_A, color='#FF4B4B', lw=2, linestyle='-.', label=f'Cathode A ({mat_A})')
-    ax1.plot(x_grid, accum_B, color='#00CC96', lw=2, linestyle='-.', label=f'Cathode B ({mat_B})')
-    
-    # Substrate Indicator Overlay
-    ax1.axvspan(-sub_width/2, sub_width/2, color='gray', alpha=0.1, label="Substrate Width")
-    
-    ax1.set_xlabel("Cross-Web Translation Axis (X mm)")
-    ax1.set_ylabel("Accumulated Linear Dose (nm)")
-    ax1.grid(True, linestyle=':', alpha=0.7)
-    ax1.legend(loc="lower center", ncol=2)
-    
-    # Mandatory Watermarking
-    fig1.text(0.5, -0.05, "Simulation provided by AZ Thin Film Research | www.azthinfilm.com", ha='center', fontsize=8, color='gray')
-    st.pyplot(fig1)
-
-with col_plot2:
-    st.subheader("Berg Reactive Process Window")
-    fig2, ax2 = plt.subplots(figsize=(6, 5))
-    
-    flows = np.linspace(0, 150, 100)
-    rates = [calculate_berg_hysteresis(f, pump_speed, pressure, total_power, mat_A, mat_B)[1] * 100 for f in flows]
-    
-    ax2.plot(flows, rates, color="#1E3A8A", lw=2.5, label="Deposition Rate Hysteresis")
-    
-    # Highlight specific operating setpoint on the curve
-    ax2.scatter([reactive_flow], [rate_mult*100], color='gold', edgecolor='black', s=100, zorder=5, label="Current Setpoint")
-    
-    # Annotate Hysteresis Cliff
-    ax2.axvspan(q_crit - 10, q_crit + 10, color="gray", alpha=0.2, label="Instability Zone")
-    
-    ax2.set_xlabel("Reactive Gas Flow (sccm)")
-    ax2.set_ylabel("Relative Dep Rate Yield (%)")
-    ax2.legend(loc="lower left", fontsize=9)
-    ax2.grid(True, linestyle=':', alpha=0.7)
-    
-    fig2.text(0.5, -0.05, "Simulation provided by AZ Thin Film Research | www.azthinfilm.com", ha='center', fontsize=8, color='gray')
-    st.pyplot(fig2)
+        # Left target is at Y = -t2t_gap/2. Right is at Y = +t2t_gap/2
+        flux_L = calculate_flux(-st.session_state.t2t_gap/2, st.session_state.mag_ang_a)
+        flux_R = calculate_flux(st.session_state.t2t_gap/2, st.session_state.mag_ang_b)
+        
+        # Kinematic translation pass (Scale by power and velocity)
+        dy = y_grid[1] - y_grid[0]
+        # Calculate time spent over each dy element: dt = dy / sub_vel
+        dt = dy / st.session_state.sub_vel
+        # Apply pseudo-yield coefficient
+        yield_proxy = 10000.0 * st.session_state.power_kw 
+        
+        accum_L = np.sum(flux_L, axis=0) * yield_proxy * dt
+        accum_R = np.sum(flux_R, axis=0) * yield_proxy * dt
+        accum_total = accum_L + accum_R
+        
+        # Mask data explicitly to Substrate Width
+        sub_mask = (x_grid >= -st.session_state.sub_width/2) & (x_grid <= st.session_state.sub_width/2)
+        mean_thk = np.mean(accum_total[sub_mask])
+        unif = (np.max(accum_total[sub_mask]) - np.min(accum_total[sub_mask])) / (2 * mean_thk) * 100 if mean_thk > 0 else 0
+        
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(x_grid, accum_total, color='black', lw=3, label='Combined Final Profile')
+        ax.plot(x_grid, accum_L, color='red', ls='--', label=f'Target L ({st.session_state.mat_a})')
+        ax.plot(x_grid, accum_R, color='blue', ls='--', label=f'Target R ({st.session_state.mat_b})')
+        
+        ax.axvspan(-st.session_state.sub_width/2, st.session_state.sub_width/2, color='gray', alpha=0.15, label='Substrate Envelope')
+        
+        ax.set_title("Machine-Direction Integrated Cross-Web Uniformity", fontweight='bold')
+        ax.set_xlabel("Cross-Web Position X (mm)")
+        ax.set_ylabel("Accumulated Dose (nm proxy)")
+        ax.grid(True, linestyle=':', alpha=0.7)
+        ax.legend(loc='lower center', ncol=4, bbox_to_anchor=(0.5, -0.3))
+        apply_watermark(fig)
+        st.pyplot(fig)
+        
+    with c2:
+        st.success("Simulation Complete")
+        st.metric("Predicted Substrate Uniformity", f"± {unif:.2f} %")
+        st.metric("Predicted Pass Average Dose", f"{mean_thk:.2f} nm")
+        
+        if unif > 5.0:
+            st.error("⚠️ **Uniformity > 5%**: Adjust Magnet Bar Angles inwards or increase Target Tube Length relative to the Substrate Width.")
+        elif unif > 2.0:
+            st.warning("✅ **Uniformity < 5%**: Acceptable profile.")
+        else:
+            st.info("⭐ **Uniformity < 2%**: Excellent baseline process design parameters.")
