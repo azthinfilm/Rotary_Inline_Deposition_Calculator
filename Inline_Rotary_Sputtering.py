@@ -2,7 +2,7 @@ import streamlit as st
 import numpy as np
 import matplotlib
 matplotlib.use("Agg") # Force headless rendering to prevent Linux web server crashes
-import matplotlib.subplots as plt
+import matplotlib.pyplots as plt
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from matplotlib.ticker import MaxNLocator
 from scipy.interpolate import RectBivariateSpline
